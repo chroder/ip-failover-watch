@@ -1,0 +1,574 @@
+#!/usr/bin/env php
+<?php
+
+$opts = getopt('', array(
+    'config-file:',        // Path to config file
+    'dry-run',             // Dont actually run anything
+    'quiet',               // Dont output status info
+    'switch::',            // force a switch now
+));
+
+$config = require(@$opts['config_file'] ?: '/etc/ip-failover.conf.php');
+
+#######################################################################
+
+function out($msg)
+{
+    global $log_messages, $quiet;
+
+    if (func_num_args() > 1) {
+        $args = func_get_args();
+        array_shift($args);
+        $msg = vsprintf($msg, $args);
+    }
+
+    $msg = '[' . date('Y-m-d H:i:s') . '] ' . trim($msg);
+
+    $log_messages[] = $msg;
+
+    if (!$quiet) {
+        echo $msg;
+        echo "\n";
+    }
+}
+
+function ssh_run_cmd($s, $log_prefix, $cmd, $with_dry_run = false)
+{
+    global $dry_run;
+
+    out("[$log_prefix]\$ $cmd");
+
+    if ($dry_run && !$with_dry_run) {
+        out("[$log_prefix] -> Dry run, not actually executing command");
+        return array(
+            'stdout' => '',
+            'stderr' => '',
+            'status' => 0
+        );
+    }
+
+    $stream = ssh2_exec($s, trim($cmd, ';') . '; echo -e "\n$?"');
+    $error_stream = ssh2_fetch_stream($stream, SSH2_STREAM_STDERR);
+    @stream_set_blocking($stream, true);
+    @stream_set_blocking($error_stream, true);
+
+    $output = stream_get_contents($stream);
+    $error_output = stream_get_contents($error_stream);
+
+    fclose($stream);
+    fclose($error_stream);
+
+    $ret = 0;
+    $matches = null;
+    if(!preg_match("/^(.*)\n(0|-?[1-9][0-9]*)$/s", $output, $matches)) {
+        $ret = -1;
+    } else {
+        if ($matches[2] !== "0") {
+            $ret = (int)$matches[2];
+        }
+    }
+
+    $output = trim($output);
+    $error_output = trim($error_output);
+
+    if ($output) {
+        foreach (explode("\n", $output) as $l) out("[$log_prefix]\t>> $l");
+    }
+    if ($error_output) {
+        foreach (explode("\n", $error_output) as $l) out("[$log_prefix]\tERR>> $l");
+    }
+
+    return array(
+        'stdout' => $output,
+        'stderr' => $error_output,
+        'status' => $ret
+    );
+}
+
+function net_healthcheck($s, $log_prefix)
+{
+    global $config;
+
+    $cmd = "mtr --report " . $config['network_health_check']['check_ip'];
+    $ret = ssh_run_cmd($s, $log_prefix . " :: mtr", $cmd, true);
+
+    if ($ret['status']) {
+        return null;
+    }
+
+    $text = trim($ret['stdout']);
+    $text = str_replace(array("\r\n", "\n"), "\n", $text);
+    $text = preg_replace("#[\-0-9]+$#", '', trim($text));
+    $text = explode("\n", trim($text));
+    $text = array_pop($text);
+    $text = trim($text);
+
+    $m = null;
+    if (!preg_match("#^.*?\s+(?P<loss>[0-9\.]+)%\s+(?P<sent>[0-9\.]+)\s+(?P<last>[0-9\.]+)\s+(?P<avg>[0-9\.]+)\s+(?P<best>[0-9\.]+)\s+(?P<worst>[0-9\.]+)\s+(?P<stdev>[0-9\.]+)$#", $text, $m)) {
+        out(">> WARN: Could not parse result from line: %s", $text);
+        return null;
+    }
+
+    // Consider the server dead
+    if ($m['loss'] >= 90) {
+        out(">> WARN: Loss of %s%%, considering this a failure", $m['loss']);
+        return null;
+    }
+
+    $data = array(
+        'avg'  => (float)$m['avg'],
+        'loss' => (float)$m['loss']
+    );
+
+    return $data;
+}
+
+function ssh_connect($host) {
+    global $config;
+    out("Connecting to $host ... ");
+    $c = ssh2_connect($host, $config['ssh_opts']['port'], array('hostkey'=>'ssh-rsa'));
+    $status = ssh2_auth_pubkey_file($c, $config['ssh_opts']['user'], $config['ssh_opts']['keyfile'] . '.pub', $config['ssh_opts']['keyfile']);
+
+    if (!$status) {
+        out("-> Failed to connect to $host");
+        return null;
+    }
+
+    out("-> OK");
+
+    return $c;
+};
+
+function stop($status, $report_error_subject = null)
+{
+    global $log_messages, $send_report, $report_subject, $dry_run, $config;
+
+    if (($send_report || $report_error_subject || $status != 0) && !$dry_run) {
+        $log = implode("\n", $log_messages);
+        $subj = $report_error_subject ?: $report_subject;
+        mail(
+            $config['alert_email'],
+            "[IP Failover Watcher] $subj" . ($status != 0 ? " (err $status)" : ''),
+            $log
+        );
+    }
+
+    exit($status);
+}
+
+function run_check_url($url)
+{
+    global $config;
+
+    out("[http] GET $url");
+    $handle = curl_init($url);
+    curl_setopt($handle,  CURLOPT_RETURNTRANSFER, TRUE);
+    curl_setopt($handle, CURLOPT_CONNECTTIMEOUT, $config['timeout']);
+    curl_setopt($handle, CURLOPT_TIMEOUT, $config['timeout']);
+
+    $response  = curl_exec($handle);
+    $http_code = curl_getinfo($handle, CURLINFO_HTTP_CODE);
+
+    curl_close($handle);
+
+    out("[http] -> status($http_code)");
+
+    if ($response) {
+        foreach (explode("\n", $response) as $l) out("[http] -> $l");
+    } else {
+        out("[http] -> empty response");
+    }
+
+    return array(
+        'content' => $response ?: '',
+        'code'    => ((int)$http_code) ?: 0,
+    );
+}
+
+#######################################################################
+
+$log_messages   = array();
+$send_report    = null;
+$report_subject = 'Status Alert';
+$dry_run        = isset($opts['dry-run']);
+$quiet          = isset($opts['quiet']);
+$force_switch   = isset($opts['switch']);
+$force_switch_to = @$opts['switch'] ?: '';
+
+if ($dry_run) {
+    out("NOTE: DRY RUN");
+}
+
+out("[INFO] ServerA:     " . $config['server_a']['ip']);
+out("[INFO] ServerB:     " . $config['server_b']['ip']);
+out("[INFO] Failover IP: " . $config['failover_ip']);
+
+out("");
+
+if ($force_switch) {
+    out("NOTE: --switch flag was passed, a switch will be made so long as the target server is available.");
+    out("");
+}
+
+#######################################################################
+# SSH Connections
+#######################################################################
+
+out("Connecting to ServerA");
+$ssh_servera = ssh_connect($config['server_a']['ip']);
+
+if (!$ssh_servera) {
+    out("ServerA is unresponsive. We will assume it is dead.");
+}
+
+out("Connecting to ServerB");
+$ssh_serverb = ssh_connect($config['server_b']['ip']);
+
+if (!$ssh_serverb) {
+    out("ServerB is unresponsive. We will assume it is dead.");
+}
+
+if (!$ssh_servera && !$ssh_serverb) {
+    out("BOTH SERVERS UNRESPONSIVE");
+    out("There is nothing we can do right now, this requires manual intervention.");
+    stop(1, "URGENT: Both servers unresponsive");
+}
+
+#######################################################################
+# Get eth status
+#######################################################################
+
+$a_failed = $b_failed = false;
+$a_has = $b_has = false;
+
+if ($ssh_servera) {
+    $ret = ssh_run_cmd($ssh_servera, "ServerA", "ifconfig | grep '{$config['failover_ip']}'", true);
+    if ($ret['status'] === -1) {
+        // the command failed
+        out("Command failed, assuming A does not have the ip");
+        $a_failed = true;
+    } else if ($ret['status'] === 0) {
+        // grep returns 0 when there is a match
+        out("ServerA has the ip");
+        $a_has = true;
+    }
+}
+
+if ($ssh_serverb) {
+    $ret = ssh_run_cmd($ssh_serverb, "ServerB", "ifconfig | grep '{$config['failover_ip']}'", true);
+    if ($ret['status'] === -1) {
+        // the command failed
+        out("Command failed, assuming B does not have the ip");
+        $b_failed = true;
+    } else if ($ret['status'] === 0) {
+        // grep returns 0 when there is a match
+        out("ServerB has the ip");
+        $b_has = true;
+    }
+}
+
+if ($a_failed && $b_failed) {
+    out("BOTH SERVERS FAILED TO RETURN CORRECT STATUS");
+    stop(1, "URGENT: Could not get status of IP");
+}
+
+if (!$a_has && !$b_has) {
+    out("BOTH SERVERS DO NOT HAVE IP");
+    out("We will attempt to bring it online on one");
+    $send_report = true;
+    $report_subject = 'NOTICE: IP not enabled on any server (will attempt to correct)';
+}
+
+#######################################################################
+# Check status of the server
+#######################################################################
+
+$a_available = $b_available = false;
+
+if ($ssh_servera) {
+    out("Checking if ServerA is available");
+    $ret = run_check_url($config['server_a']['check_url']);
+    if ($ret['code'] === 200) {
+        out("ServerA is available");
+        $a_available = true;
+    } else {
+        out("ServerA failed check_url");
+    }
+}
+
+if ($ssh_serverb) {
+    out("Checking if ServerB is available");
+    $ret = run_check_url($config['server_b']['check_url']);
+    if ($ret['code'] === 200) {
+        out("ServerB is available");
+        $b_available = true;
+    } else {
+        out("ServerB failed check_url");
+    }
+}
+
+if (!$a_available && !$b_available) {
+    out("BOTH SERVERS ARE NOT AVAILABLE");
+    stop(1, "URGENT: Status check failed on both servers");
+}
+
+#######################################################################
+# Check network
+#######################################################################
+
+$nethealth_switch_hint = null;
+
+if (!empty($config['network_health_check'])) {
+    out("");
+    out("Running MTR health checks to verify network connection.");
+
+    $a_health = $b_health = null;
+
+    if ($ssh_servera) {
+        $a_health = net_healthcheck($ssh_servera, "ServerA");
+
+        if (!$a_health) {
+            $send_report = true;
+            $report_subject = 'WARNING: Network health check';
+        } else {
+            out("[ServerA :: Health check] AvgTime: %0.1fms  Loss: %0.1f%%", $a_health['avg'], $a_health['loss']);
+            if ($a_health['avg'] >= $config['network_health_check']['warn_at_time']) {
+                out("[ServerA :: Health check] WARN: Avg time of %0.1f is greater than %0.1f", $a_health['avg'], $config['network_health_check']['warn_at_time']);
+                $send_report = true;
+                $report_subject = 'WARNING: Network health check';
+            } else if ($a_health['loss'] >= $config['network_health_check']['warn_at_loss']) {
+                out("[ServerA :: Health check] WARN: Loss of %0.1f%% is greater than %0.1f%%", $a_health['loss'], $config['network_health_check']['warn_at_loss']);
+                $send_report = true;
+                $report_subject = 'WARNING: Network health check';
+            } else {
+                out("[ServerA :: Health check] OK");
+            }
+        }
+    }
+    if ($ssh_serverb) {
+        $b_health = net_healthcheck($ssh_serverb, "ServerB");
+
+        if (!$b_health) {
+            $send_report = true;
+            $report_subject = 'WARNING: Network health check';
+        } else {
+            out("[ServerB :: Health check] AvgTime: %0.1fms  Loss: %0.1f%%", $b_health['avg'], $b_health['loss']);
+            if ($b_health['avg'] >= $config['network_health_check']['warn_at_time']) {
+                out("[ServerB :: Health check] WARN: Avg time of %0.1fms is greater than %0.1fms", $b_health['avg'], $config['network_health_check']['warn_at_time']);
+                $send_report = true;
+                $report_subject = 'WARNING: Network health check';
+            } else if ($b_health['loss'] >= $config['network_health_check']['warn_at_loss']) {
+                out("[ServerB :: Health check] WARN: Loss of %0.1f%% is greater than %0.1f%%", $b_health['loss'], $config['network_health_check']['warn_at_loss']);
+                $send_report = true;
+                $report_subject = 'WARNING: Network health check';
+            } else {
+                out("[ServerB :: Health check] OK");
+            }
+        }
+    }
+
+    if ($a_health && $b_health) {
+        $avg_diff  = abs($a_health['avg'] - $b_health['avg']);
+        $loss_diff = abs($a_health['loss'] - $b_health['loss']);
+
+        if ($avg_diff > $config['network_health_check']['switch_with_timediff']) {
+            if ($a_health['avg'] < $b_health['avg']) {
+                if (!$a_has) {
+                    out("[Health check] Switching to ServerA because network health is better: Ping: ServerA(%0.1fms) ServerB(%0.1fms)", $a_health['avg'], $b_health['avg']);
+                    $nethealth_switch_hint = 'a';
+                }
+            } else {
+                if (!$b_has) {
+                    out("[Health check] Switching to ServerB because network health is better: Ping: ServerA(%0.1fms) ServerB(%0.1fms)", $a_health['avg'], $b_health['avg']);
+                    $nethealth_switch_hint = 'b';
+                }
+            }
+        } else if ($loss_diff > $config['network_health_check']['switch_with_lossdiff']) {
+            if ($a_health['loss'] < $b_health['loss']) {
+                if (!$a_has) {
+                    out("[Health check] Switching to ServerA because network health is better: Loss: ServerA(%0.1f%%) ServerB(%0.1f%%)", $a_health['loss'], $b_health['loss']);
+                    $nethealth_switch_hint = 'a';
+                }
+            } else {
+                if (!$b_has) {
+                    out("[Health check] Switching to ServerB because network health is better: Loss: ServerA(%0.1f%%) ServerB(%0.1f%%)", $a_health['loss'], $b_health['loss']);
+                    $nethealth_switch_hint = 'b';
+                }
+            }
+        }
+    } else if ($a_health || $b_health) {
+        if ($a_health && !$b_health) {
+            if (!$a_has) {
+                out("[Health check] Switching to ServerA because ServerB is dead");
+                $nethealth_switch_hint = 'a';
+            }
+        } else if (!$a_health && $b_health) {
+            if (!$b_has) {
+                out("[Health check] Switching to ServerB because ServerA is dead");
+                $nethealth_switch_hint = 'b';
+            }
+        }
+    }
+
+    out("");
+}
+
+#######################################################################
+# Soft errors
+#######################################################################
+
+// If a server is offline, we need to enable the report email
+
+if (!$a_available || !$ssh_servera) {
+    out("Notice: ServerA is unavailable");
+    $send_report = true;
+    $report_subject = "NOTICE: ServerA is unavailable";
+} else if (!$b_available || !$ssh_serverb) {
+    out("Notice: ServerB is unavailable");
+    $send_report = true;
+    $report_subject = "NOTICE: ServerB is unavailable";
+}
+
+#######################################################################
+# Check if we need to switch ips
+#######################################################################
+
+$switch_to = null;
+
+if ($force_switch) {
+    $force_switch_to = strtolower($force_switch_to);
+    if ($force_switch_to == 'a' || $force_switch_to == 'b') {
+        if ($force_switch_to == 'a' && $a_available) {
+            $switch_to = 'a';
+        } elseif ($force_switch_to == 'b' && $b_available) {
+            $switch_to = 'b';
+        }
+    } else {
+        if ($a_available && $b_available) {
+            if ($a_has) {
+                $switch_to = 'b';
+            } else {
+                $switch_to = 'a';
+            }
+        } else if (!$a_available && $b_available) {
+            $switch_to = 'b';
+        } else if (!$b_available && $a_available) {
+            $switch_to = 'a';
+        }
+    }
+
+    if ($switch_to) {
+        out("--switch flag enabled: Switching to $switch_to");
+    } else {
+        out("--switch flag enabled: ERROR: opposite server is not available so we are not going to switch!");
+    }
+} else {
+    if ($nethealth_switch_hint) {
+        out("Network Health Check :: Switching to %s because of network health check", $nethealth_switch_hint);
+        $switch_to = $nethealth_switch_hint;
+    } else if ($a_available && $b_available) {
+        if ($a_has && $b_has) {
+            out("IP is on both servers, will fix by taking it off ServerB");
+            $switch_to = 'a';
+        }
+    } else if ($a_available && !$b_available) {
+        if (!$a_has) {
+            out("ServerB is unavailable but ServerA does not have IP. Will bring it up on ServerA.");
+            $switch_to = 'a';
+        }
+    } else if ($b_available && !$a_available) {
+        if (!$b_has) {
+            out("ServerA is unavailable but ServerB does not have IP. Will bring it up on ServerB.");
+            $switch_to = 'b';
+        }
+    }
+}
+
+out("");
+out("Summary:");
+
+$a_sum = "ServerA[{$config['server_a']['ip']}] -- ";
+if ($a_available) {
+    $a_sum .= "OK -- " . ($a_has ? 'HAS IP' : 'no ip');
+} else {
+    $a_sum .= "DOWN";
+}
+out($a_sum);
+
+$b_sum = "ServerB[{$config['server_b']['ip']}] -- ";
+if ($b_available) {
+    $b_sum .= "OK -- " . ($b_has ? 'HAS IP' : 'no ip');
+} else {
+    $b_sum .= "DOWN";
+}
+out($b_sum);
+
+if ($switch_to) {
+    out("FailoverIP[{$config['failover_ip']}] -- FAIL -- Failover to Server".strtoupper($switch_to) . " will happen now");
+} else {
+    out("FailoverIP[{$config['failover_ip']}] -- OK -- Failover not needed");
+}
+
+out("");
+
+if ($switch_to) {
+    switch ($switch_to) {
+        case 'a':
+            $old_host = $config['server_b'];
+            $old_name = 'ServerB';
+            $old_ssh  = $ssh_serverb;
+            $new_host = $config['server_a'];
+            $new_name = 'ServerA';
+            $new_ssh  = $ssh_servera;
+            break;
+        case 'b':
+            $old_host = $config['server_a'];
+            $old_name = 'ServerA';
+            $old_ssh  = $ssh_servera;
+            $new_host = $config['server_b'];
+            $new_name = 'ServerB';
+            $new_ssh  = $ssh_serverb;
+            break;
+    }
+
+    out("Switching IP from $old_name to $new_name");
+
+    if ($old_ssh) {
+        out("$old_name: Bringing down {$old_host['failover_eth']}");
+        $r = ssh_run_cmd($old_ssh, $old_name, "ifdown {$old_host['failover_eth']}");
+        if ($r['status']) {
+            out("-> ERROR: ifdown failed, but we will continue anyway.");
+        }
+    } else {
+        out("$old_name is not accessible, so I will cannot ifdown if the ip is there.");
+    }
+
+    out("$new_name: Bringing up {$new_host['failover_eth']}");
+    $r = ssh_run_cmd($new_ssh, $new_name, "ifup {$new_host['failover_eth']}");
+    if ($r['status']) {
+        out("-> ERROR: ifup failed, but we will continue anyway in case it was some kind of false status. !!!CHECK THIS!!!");
+    }
+
+    out("$new_name: arping to enable the ip on this host");
+    $r = ssh_run_cmd($new_ssh, $new_name, "arping -d -I {$new_host['failover_eth']} -c 5 {$config['failover_ip']}");
+
+    if ($r['status']) {
+        out("-> ERROR: arping failed. CHECK THIS. This indicates the ip is detected on more than one machine.");
+    } else {
+        out("-> OK. (It is okay if the above command may output '100% unaswered')");
+    }
+
+    out("arping from this host");
+    if (!$dry_run) {
+        exec("arping -d -c 5 {$config['failover_ip']}");
+        out("-> Done");
+    } else {
+        out("-> Dry run, not actually executing command");
+    }
+
+    out("All procedures have finished.");
+    stop(0, "NOTICE: IP failover was run");
+} else {
+    out("Everything looks okay");
+    stop(0);
+}
